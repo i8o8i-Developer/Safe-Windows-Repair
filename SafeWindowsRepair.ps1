@@ -1,323 +1,293 @@
 <#
 .SYNOPSIS
-    SafeWindowsRepair.ps1
+    Safe Windows Repair Utility (SafeWindowsRepair.ps1)
+
 .DESCRIPTION
-    Safely Stops And Restarts Essential Windows Services And Performs Common Network Repair Steps.
-    All Visible Text And Comments Use Pascal Case Formatting.
-.NOTES
-    - Run This Script As Administrator.
-    - This Script Executes Netsh And Ipconfig Commands That May Temporarily Disrupt Network Connectivity.
+    Performs A Set Of Common Windows Repair And Cleanup Tasks Safely:
+      - Logging To A TimeStamped Log File In Script Folder
+      - Checks For Elevation (Admin)
+      - Stops/Starts Specified Services
+      - Clears Temp Folders And Windows Update Cache (SoftwareDistribution)
+      - Runs DISM Restore-Health And SFC /Scannow
+      - Resets Winsock And Flushes DNS
+      - Optionally Reboots
 #>
 
-#region -- Configuration Section --
+#region --- Helper Functions ---
 
-# Define Services To Repair
-$ServicesToRepair = @(
-    "wuauserv",         # Windows Update Service
-    "bits",             # Background Intelligent Transfer Service
-    "TrustedInstaller", # Windows Modules Installer
-    "cryptsvc",         # Cryptographic Service
-    "msiserver"         # Windows Installer Service
-)
-
-# Define Log File Path
-$ScriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
-$LogFile = Join-Path -Path $ScriptDirectory -ChildPath "SafeWindowsRepair.log"
-
-# Define Sleep Duration Between Service Actions (In Milliseconds)
-$SleepBetweenActionsMs = 500
-
-# Define Network Commands Timeout (Seconds)
-$NetworkCommandTimeoutSec = 60
-
-# Toggle For Performing Network Repair (Set To $True To Run Network Repair Steps)
-$PerformNetworkRepair = $True
-
-#endregion
-
-#region -- Helper Functions Section --
-
-# Write Log Function
-Function Write-Log {
-    Param(
-        [Parameter(Mandatory = $True)]
-        [String] $Message,
-
-        [ValidateSet("INFO","WARN","ERROR")]
-        [String] $Level = "INFO"
+function Write-Log {
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [ValidateSet('INFO','WARN','ERROR','DEBUG')][string]$Level = 'INFO'
     )
 
-    # Create Timestamp
-    $Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-    $Line = "{0} [{1}] {2}" -f $Timestamp, $Level, $Message
-
-    # Display Log Message
-    If ($Level -eq "ERROR") {
-        Write-Host $Line -ForegroundColor Red
-    } ElseIf ($Level -eq "WARN") {
-        Write-Host $Line -ForegroundColor Yellow
-    } Else {
-        Write-Host $Line
+    $TimeStamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    $Line = "$TimeStamp [$Level] $Message"
+    # Write To Console With Color
+    switch ($Level) {
+        'INFO'  { Write-Host $Line -ForegroundColor Green }
+        'WARN'  { Write-Host $Line -ForegroundColor Yellow }
+        'ERROR' { Write-Host $Line -ForegroundColor Red }
+        'DEBUG' { Write-Host $Line -ForegroundColor Cyan }
     }
-
-    # Write To Log File
-    Try {
-        Add-Content -Path $LogFile -Value $Line -ErrorAction Stop
-    } Catch {
-        Write-Host ("{0} [WARN] Failed To Write Log: {1}" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss"), ${_}) -ForegroundColor Yellow
-    }
-}
-
-# Ensure Script Is Run As Administrator
-Function Ensure-Administrator {
-    $IsAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    If (-Not $IsAdmin) {
-        Write-Log "Script Must Be Run As Administrator. Exiting." "ERROR"
-        Throw "Administrator Privileges Required."
-    }
-}
-
-# Safely Stop A Service
-Function Stop-ServiceSafe {
-    Param(
-        [Parameter(Mandatory = $True)]
-        [String] $Svc
-    )
-
-    Try {
-        $ServiceObj = Get-Service -Name $Svc -ErrorAction Stop
-    } Catch {
-        Write-Log ("Service Not Found: " + $Svc) "WARN"
-        Return $False
-    }
-
-    If ($ServiceObj.Status -eq "Stopped") {
-        Write-Log ("Service Already Stopped: " + $Svc) "INFO"
-        Return $True
-    }
-
-    Try {
-        Write-Log ("Stopping Service : " + $Svc) "INFO"
-        Stop-Service -Name $Svc -Force -ErrorAction Stop
-        Start-Sleep -Milliseconds $SleepBetweenActionsMs
-        $ServiceObj.Refresh()
-        If ($ServiceObj.Status -eq "Stopped") {
-            Write-Log ("Stopped Service : " + $Svc) "INFO"
-            Return $True
-        } Else {
-            Write-Log ("Service Did Not Stop As Expected: " + $Svc) "WARN"
-            Return $False
+    # Append To Log File If Global Variable Set
+    if ($Script:LogPath) {
+        try {
+            Add-Content -Path $Script:LogPath -Value $Line -ErrorAction Stop
+        } catch {
+            Write-Host "Failed To Write To Log : $($_.Exception.Message)" -ForegroundColor Red
         }
-    } Catch {
-        Write-Log ("Failed To Stop ${Svc}: ${_}") "ERROR"
-        Return $False
     }
 }
 
-# Safely Start A Service
-Function Start-ServiceSafe {
-    Param(
-        [Parameter(Mandatory = $True)]
-        [String] $Svc
+function Ensure-Administrator {
+    if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
+        Write-Error "This Script Must Be Run As Administrator. Right-Click And 'Run As Administrator'."
+        Exit 1
+    } else {
+        Write-Log "Confirmed Running As Administrator." "DEBUG"
+    }
+}
+
+function Backup-Folder {
+    param(
+        [Parameter(Mandatory = $true)][string]$FolderPath,
+        [string]$BackupRoot = "$env:TEMP\SafeWindowsRepairBackups"
     )
 
-    Try {
-        $ServiceObj = Get-Service -Name $Svc -ErrorAction Stop
-    } Catch {
-        Write-Log ("Service Not Found: " + $Svc) "WARN"
-        Return $False
-    }
-
-    If ($ServiceObj.Status -eq "Running") {
-        Write-Log ("Service Already Running: " + $Svc) "INFO"
-        Return $True
-    }
-
-    Try {
-        Write-Log ("Starting Service : " + $Svc) "INFO"
-        Start-Service -Name $Svc -ErrorAction Stop
-        Start-Sleep -Milliseconds $SleepBetweenActionsMs
-        $ServiceObj.Refresh()
-        If ($ServiceObj.Status -eq "Running") {
-            Write-Log ("Started Service : " + $Svc) "INFO"
-            Return $True
-        } Else {
-            Write-Log ("Service Did Not Start As Expected: " + $Svc) "WARN"
-            Return $False
+    try {
+        if (-not (Test-Path -Path $FolderPath)) {
+            Write-Log "Backup-Folder: Source Path ${FolderPath} Does Not Exist, Skipping." "WARN"
+            return $null
         }
-    } Catch {
-        Write-Log ("Failed To Start ${Svc}: ${_}") "ERROR"
-        Return $False
+        New-Item -Path $BackupRoot -ItemType Directory -Force | Out-Null
+        $TimeStamp = (Get-Date).ToString('yyyyMMdd_HHmmss')
+        $SafeName = ([IO.Path]::GetFileName($FolderPath) -replace '[^a-zA-Z0-9\-_.]','_')
+        $Dest = Join-Path -Path $BackupRoot -ChildPath "${SafeName}_Backup_${TimeStamp}"
+        Write-Log "Backing up ${FolderPath} to ${Dest}." "INFO"
+        Copy-Item -Path $FolderPath -Destination $Dest -Recurse -Force -ErrorAction Stop
+        return $Dest
+    } catch {
+        Write-Log "Backup-Folder Failed For ${FolderPath}: $($_.Exception.Message)" "ERROR"
+        return $null
     }
 }
 
-#endregion
-
-#region -- Network Repair Functions Section --
-
-# Run A Command And Wait For Completion, Capturing Output
-Function Invoke-CommandSafe {
-    Param(
-        [Parameter(Mandatory = $True)]
-        [String] $FilePath,
-
-        [Parameter(Mandatory = $True)]
-        [String[]] $Arguments,
-
-        [Int] $TimeoutSec = $NetworkCommandTimeoutSec
+function Stop-ServiceSafe {
+    param(
+        [Parameter(Mandatory = $true)][string]$ServiceName,
+        [int]$TimeoutSeconds = 20
     )
 
-    $ArgsString = $Arguments -join " "
-    Write-Log ("Executing Command: " + $FilePath + " " + $ArgsString) "INFO"
-
-    Try {
-        $Proc = Start-Process -FilePath $FilePath -ArgumentList $Arguments -NoNewWindow -PassThru -Wait -WindowStyle Hidden
-        # Start-Process -Wait returns when process exits; check exit code if available
-        If ($Proc.ExitCode -ne $null -and $Proc.ExitCode -ne 0) {
-            Write-Log ("Command Exit Code NonZero: " + $Proc.ExitCode + " For: " + $FilePath + " " + $ArgsString) "WARN"
-        } Else {
-            Write-Log ("Command Completed Successfully: " + $FilePath + " " + $ArgsString) "INFO"
-        }
-    } Catch {
-        Write-Log ("Failed To Execute Command " + $FilePath + " " + $ArgsString + " : ${_}") "ERROR"
-    }
-}
-
-# Reset Winsock
-Function Reset-Winsock {
-    Write-Log "Resetting Winsock." "INFO"
-    Invoke-CommandSafe -FilePath (Join-Path -Path $env:SystemRoot -ChildPath "System32\netsh.exe") -Arguments @("winsock","reset")
-    Write-Log "Winsock Reset Completed. A Restart May Be Required For Changes To Take Effect." "INFO"
-}
-
-# Reset TcpIp Stack
-Function Reset-TcpIp {
-    Write-Log "Resetting TcpIp Stack." "INFO"
-    Invoke-CommandSafe -FilePath (Join-Path -Path $env:SystemRoot -ChildPath "System32\netsh.exe") -Arguments @("int","ip","reset")
-    Write-Log "TcpIp Reset Completed. A Restart May Be Required For Changes To Take Effect." "INFO"
-}
-
-# Flush And Register DNS
-Function Repair-Dns {
-    Write-Log "Flushing Dns Resolver Cache." "INFO"
-    Invoke-CommandSafe -FilePath (Join-Path -Path $env:SystemRoot -ChildPath "System32\ipconfig.exe") -Arguments @("/flushdns")
-
-    Write-Log "Registering Dns Names." "INFO"
-    Invoke-CommandSafe -FilePath (Join-Path -Path $env:SystemRoot -ChildPath "System32\ipconfig.exe") -Arguments @("/registerdns")
-    Write-Log "Dns Repair Completed." "INFO"
-}
-
-# Renew Dhcp Lease
-Function Renew-DhcpLease {
-    Write-Log "Releasing Dhcp Lease." "INFO"
-    Invoke-CommandSafe -FilePath (Join-Path -Path $env:SystemRoot -ChildPath "System32\ipconfig.exe") -Arguments @("/release")
-
-    Start-Sleep -Seconds 1
-
-    Write-Log "Renewing Dhcp Lease." "INFO"
-    Invoke-CommandSafe -FilePath (Join-Path -Path $env:SystemRoot -ChildPath "System32\ipconfig.exe") -Arguments @("/renew")
-    Write-Log "Dhcp Lease Renew Completed." "INFO"
-}
-
-# Restart Key Network Services
-Function Restart-NetworkServices {
-    $NetworkServices = @("Dhcp","Dnscache","NlaSvc","Netman") # Dhcp, Dns Client, Network Location Awareness, Network Connections
-    ForEach ($Svc In $NetworkServices) {
-        Try {
-            $SvcObj = Get-Service -Name $Svc -ErrorAction Stop
-            If ($SvcObj.Status -eq "Running") {
-                Write-Log ("Restarting Network Service: " + $Svc) "INFO"
-                Restart-Service -Name $Svc -Force -ErrorAction Stop
-                Start-Sleep -Milliseconds $SleepBetweenActionsMs
-                Write-Log ("Restarted Network Service: " + $Svc) "INFO"
-            } Else {
-                Write-Log ("Starting Network Service: " + $Svc) "INFO"
-                Start-Service -Name $Svc -ErrorAction Stop
-                Start-Sleep -Milliseconds $SleepBetweenActionsMs
-                Write-Log ("Started Network Service: " + $Svc) "INFO"
+    try {
+        $svc = Get-Service -Name $ServiceName -ErrorAction Stop
+        if ($svc.Status -ne 'Stopped') {
+            Write-Log "Stopping service ${ServiceName}..." "INFO"
+            Stop-Service -Name $ServiceName -Force -ErrorAction Stop
+            $Waited = 0
+            while ((Get-Service -Name $ServiceName).Status -ne 'Stopped' -and $Waited -lt $TimeoutSeconds) {
+                Start-Sleep -Seconds 1
+                $Waited++
             }
-        } Catch {
-            Write-Log ("Failed To Restart/Start Network Service ${Svc}: ${_}") "WARN"
+            if ((Get-Service -Name $ServiceName).Status -ne 'Stopped') {
+                Write-Log "Service ${ServiceName} did not stop within ${TimeoutSeconds} seconds." "WARN"
+            } else {
+                Write-Log "Service ${ServiceName} stopped." "INFO"
+            }
+        } else {
+            Write-Log "Service ${ServiceName} Is Already Stopped." "DEBUG"
         }
+    } catch {
+        Write-Log "Failed To Stop ${ServiceName}: $($_.Exception.Message)" "WARN"
     }
 }
 
-# High Level Network Repair Sequence
-Function Repair-Network {
-    Write-Log "Beginning Network Repair Sequence." "INFO"
+function Start-ServiceSafe {
+    param(
+        [Parameter(Mandatory = $true)][string]$ServiceName,
+        [int]$TimeoutSeconds = 20
+    )
 
-    # Reset Winsock Then TcpIp
-    Reset-Winsock
-    Reset-TcpIp
+    try {
+        $svc = Get-Service -Name $ServiceName -ErrorAction Stop
+        if ($svc.Status -ne 'Running') {
+            Write-Log "Starting Service ${ServiceName}..." "INFO"
+            Start-Service -Name $ServiceName -ErrorAction Stop
+            $Waited = 0
+            while ((Get-Service -Name $ServiceName).Status -ne 'Running' -and $Waited -lt $TimeoutSeconds) {
+                Start-Sleep -Seconds 1
+                $Waited++
+            }
+            if ((Get-Service -Name $ServiceName).Status -ne 'Running') {
+                Write-Log "Service ${ServiceName} Did Not Start Within ${TimeoutSeconds} seconds." "WARN"
+            } else {
+                Write-Log "Service ${ServiceName} Started." "INFO"
+            }
+        } else {
+            Write-Log "Service ${ServiceName} Is Already Running." "DEBUG"
+        }
+    } catch {
+        Write-Log "Could Not Start ${ServiceName}: $($_.Exception.Message)" "ERROR"
+    }
+}
 
-    # Flush And Register Dns
-    Repair-Dns
+function Clear-TempFolder {
+    param(
+        [Parameter(Mandatory = $true)][string]$PathToClear
+    )
 
-    # Renew Dhcp Lease
-    Renew-DhcpLease
-
-    # Restart Key Network Services
-    Restart-NetworkServices
-
-    Write-Log "Network Repair Sequence Completed. A System Restart Is Recommended If Connectivity Issues Persist." "INFO"
+    try {
+        if (Test-Path -Path $PathToClear) {
+            Write-Log "Clearing Contents Of ${PathToClear} ..." "INFO"
+            Get-ChildItem -Path $PathToClear -Force -ErrorAction SilentlyContinue | ForEach-Object {
+                try {
+                    Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction Stop
+                } catch {
+                    Write-Log "Error Cleaning ${PathToClear}: $($_.Exception.Message)" "WARN"
+                }
+            }
+            Write-Log "Cleared ${PathToClear}." "INFO"
+        } else {
+            Write-Log "Path ${PathToClear} Does Not Exist, Skipping." "DEBUG"
+        }
+    } catch {
+        Write-Log "Clear-TempFolder Failed For ${PathToClear}: $($_.Exception.Message)" "ERROR"
+    }
 }
 
 #endregion
 
-#region -- Main Execution Section --
+#region --- Main Script Execution ---
 
-Try {
+try {
+    # Location / Log File Setup
+    $ScriptRoot = Split-Path -Path $MyInvocation.MyCommand.Definition -Parent
+    if (-not $ScriptRoot) { $ScriptRoot = Get-Location }
+    $TimeStamp = (Get-Date).ToString('yyyyMMdd_HHmmss')
+    $LogFileName = "SafeWindowsRepair_${TimeStamp}.log"
+    $LogPath = Join-Path -Path $ScriptRoot -ChildPath $LogFileName
+    $Script:LogPath = $LogPath
+
+    # Create Log File
+    New-Item -Path $LogPath -ItemType File -Force | Out-Null
+    Write-Log "SafeWindowsRepair Started. Log: ${LogPath}" "INFO"
+
     Ensure-Administrator
 
-    # Create Log File Header
-    $Header = "=== Safe Windows Repair Run At {0} ===" -f (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-    Add-Content -Path $LogFile -Value $Header
+    # Show Summary And Ask For Confirmation
+    Write-Host ""
+    Write-Host "This Script Will Perform Non-Destructive Repairs And Cleanup On This PC." -ForegroundColor Yellow
+    Write-Host "Actions Include : stop/start Services, Clear Temp Folders, Reset Update Cache, Run DISM + SFC, Reset Network Stack." -ForegroundColor Yellow
+    $Proceed = Read-Host "Type YES To Continue (Or Anything Else To Abort)"
+    if ($Proceed -ne 'YES') {
+        Write-Log "User Aborted The Operation." "INFO"
+        Exit 0
+    }
 
-    Write-Log "Beginning Safe Windows Repair Process." "INFO"
+    # Services To Temporarily Stop (Example) - Safe Defaults
+    $ServicesToStop = @(
+        'wuauserv',     # Windows Update
+        'BITS',         # Background Intelligent Transfer
+        'DoSvc'         # Delivery Optimization (Optional)
+    )
 
-    # Iterate Through All Services
-    ForEach ($ServiceName In $ServicesToRepair) {
-        $Svc = $ServiceName.Trim()
-        Write-Log ("Processing Service: " + $Svc) "INFO"
+    # Stop services
+    foreach ($Svc in $ServicesToStop) {
+        Stop-ServiceSafe -ServiceName $Svc -TimeoutSeconds 25
+    }
 
-        # Stop Service
-        $Stopped = Stop-ServiceSafe -Svc $Svc
+    # Back Up SoftwareDistribution And Clear It
+    $SoftwareDistribution = 'C:\Windows\SoftwareDistribution'
+    $BackupSd = Backup-Folder -FolderPath $SoftwareDistribution
+    if ($BackupSd) {
+        Write-Log "Clearing SoftwareDistribution folder ${SoftwareDistribution} ..." "INFO"
+        Clear-TempFolder -PathToClear $SoftwareDistribution
+    } else {
+        Write-Log "Skipping Clearing SoftwareDistribution Because Backup Failed Or Path Missing." "WARN"
+    }
 
-        # Optionally Modify Service Settings Here (Commented Out By Default)
-        # Try {
-        #     Set-Service -Name $Svc -StartupType Automatic -ErrorAction Stop
-        #     Write-Log ("Set Startup Type Automatic For: " + $Svc) "INFO"
-        # } Catch {
-        #     Write-Log ("Failed To Set Startup Type For ${Svc}: ${_}") "WARN"
-        # }
+    # Clear Common Temp Locations (Current User And System Temp)
+    $UserTemp = "$env:LOCALAPPDATA\Temp"
+    $SystemTemp = "$env:SystemRoot\Temp"
+    Clear-TempFolder -PathToClear $UserTemp
+    Clear-TempFolder -PathToClear $SystemTemp
 
-        # Start Service
-        $Started = Start-ServiceSafe -Svc $Svc
-
-        # Evaluate Result
-        If ($Stopped -And $Started) {
-            Write-Log ("Repair Completed For Service: " + $Svc) "INFO"
-        } ElseIf (-Not $Stopped -And $Started) {
-            Write-Log ("Service Was Not Stopped But Is Running Now: " + $Svc) "INFO"
-        } Else {
-            Write-Log ("Repair Incomplete For Service: " + $Svc) "WARN"
+    # Run DISM Restore-Health
+    try {
+        Write-Log "Running DISM Restore-Health (This Can Take Some Minutes)..." "INFO"
+        # Prefer Using Start-Process To See Output
+        $DismArgs = '/Online /Cleanup-Image /RestoreHealth'
+        $Dism = Start-Process -FilePath dism.exe -ArgumentList $DismArgs -NoNewWindow -Wait -PassThru -ErrorAction Stop
+        if ($Dism.ExitCode -eq 0) {
+            Write-Log "DISM Completed Successfully." "INFO"
+        } else {
+            Write-Log "DISM Exited With Code ${($Dism.ExitCode)}. Check DISM Logs For Details." "WARN"
         }
+    } catch {
+        Write-Log "DISM Failed: $($_.Exception.Message)" "ERROR"
     }
 
-    Write-Log "Safe Windows Repair Service Section Completed." "INFO"
-
-    # Perform Network Repair If Enabled
-    If ($PerformNetworkRepair) {
-        Repair-Network
-    } Else {
-        Write-Log "Network Repair Skipped (PerformNetworkRepair Is False)." "INFO"
+    # Run SFC /Scannow
+    try {
+        Write-Log "Running sfc /scannow..." "INFO"
+        $Sfc = Start-Process -FilePath sfc.exe -ArgumentList '/scannow' -NoNewWindow -Wait -PassThru -ErrorAction Stop
+        if ($Sfc.ExitCode -eq 0) {
+            Write-Log "SFC Completed (ExitCode 0)." "INFO"
+        } else {
+            Write-Log "SFC Exited With Code ${($Sfc.ExitCode)}. Review CBS Logs For Details." "WARN"
+        }
+    } catch {
+        Write-Log "SFC Failed: $($_.Exception.Message)" "ERROR"
     }
 
-    Write-Log "Safe Windows Repair Completed Successfully." "INFO"
+    # Reset Network Stack: Winsock, TCP/IP, Flush DNS
+    try {
+        Write-Log "Resetting Winsock And TCP/IP Stack, Flushing DNS..." "INFO"
+        netsh winsock reset | Out-Null
+        netsh int ip reset | Out-Null
+        ipconfig /flushdns | Out-Null
+        Write-Log "Network Stack Reset Commands Executed. A Reboot May Be Required For Full Effect." "INFO"
+    } catch {
+        Write-Log "Network Reset Commands Failed : $($_.Exception.Message)" "WARN"
+    }
 
-} Catch {
-    Write-Log ("Fatal Error: ${_}") "ERROR"
-    Throw
+    # Clear Windows Update Temporary DB Files (If Any Left) - Only If Service Stopped Earlier
+    try {
+        if (-not (Get-Service -Name 'wuauserv' -ErrorAction SilentlyContinue) -or (Get-Service -Name 'wuauserv').Status -ne 'Running') {
+            $WUCache = Join-Path -Path $SoftwareDistribution -ChildPath 'DataStore'
+            if (Test-Path -Path $WUCache) {
+                Write-Log "Clearing WU DataStore ${WUCache} ..." "INFO"
+                Clear-TempFolder -PathToClear $WUCache
+            } else {
+                Write-Log "WU DataStore path ${WUCache} not found, skipping." "DEBUG"
+            }
+        } else {
+            Write-Log "Windows Update Service Running; Skipping DataStore Clear For Safety." "DEBUG"
+        }
+    } catch {
+        Write-Log "Failed Clearing WU DataStore: $($_.Exception.Message)" "WARN"
+    }
+
+    # Start Services Back Up
+    foreach ($Svc in $ServicesToStop) {
+        Start-ServiceSafe -ServiceName $Svc -TimeoutSeconds 30
+    }
+
+    Write-Log "All Operations Complete. Review The Log At ${LogPath}." "INFO"
+
+    # Suggest reboot
+    $RebootAnswer = Read-Host "Do You Want To Reboot Now? Type YES To Reboot"
+    if ($RebootAnswer -eq 'YES') {
+        Write-Log "User Chose To Reboot. Initiating Reboot..." "INFO"
+        Restart-Computer -Force
+    } else {
+        Write-Log "User Chose Not To Reboot Now." "INFO"
+    }
+
+} catch {
+    Write-Log "Fatal Error In Main Script : $($_.Exception.Message)" "ERROR"
+    Write-Host "Script Encountered A Fatal Error. See Log ${LogPath} For Details." -ForegroundColor Red
+    Exit 1
 }
 
 #endregion
