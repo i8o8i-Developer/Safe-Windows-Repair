@@ -40,7 +40,7 @@ function Write-Log {
     }
 }
 
-function Ensure-Administrator {
+function Test-Administrator {
     if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
         Write-Error "This Script Must Be Run As Administrator. Right-Click And 'Run As Administrator'."
         Exit 1
@@ -172,7 +172,7 @@ try {
     New-Item -Path $LogPath -ItemType File -Force | Out-Null
     Write-Log "SafeWindowsRepair Started. Log: ${LogPath}" "INFO"
 
-    Ensure-Administrator
+    Test-Administrator
 
     # Show Summary And Ask For Confirmation
     Write-Host ""
